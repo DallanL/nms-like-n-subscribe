@@ -1,6 +1,6 @@
 # ns-subscribe
 service to create and maintain subscriptions
-
+postgresql database is required as that is where subscription data is maintained
 
 ## Clone the repo and prepwork
 
@@ -50,3 +50,18 @@ run the docker container:
 ```bash
 docker run --env-file .env -d --name nms-like-n-subscribe -p 8001:8001 nms-like-n-subscribe
 ```
+
+
+
+### create a subscription
+i included a simple program in `/create-sub/` that works along with the subscription maintainer, it is a command line tool that lets you step through creating a single subscription... the subscription maintainer also has an API endpoint at  `<url>:8001/create-subscription` that accepts a json blob of:
+```json
+{
+	"model": <model>,
+        "domain": <domain>,
+        "post_url": <post_url>,
+        "expires": <expire date/time>,
+}
+```
+
+and creates a new subscription it will maintain
