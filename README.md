@@ -1,2 +1,2 @@
-# nms-like-n-subscribe
-Fast API endpoint that creates and maintains NetSapiens subscriptions
+# ns-subscribe
+service to create and maintain subscriptions

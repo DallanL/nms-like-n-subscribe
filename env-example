@@ -1,0 +1,12 @@
+# Postgresql Settings
+POSTGRESQL_HOST=192.168.10.21
+POSTGRESQL_PORT=5432
+POSTGRESQL_USER=<postgresqluser>
+POSTGRESQL_PASS=<strongpassword>
+POSTGRESQL_DATABASE=<your database name>
+POSTGRESQL_TABLE_SUBSCRIPTIONS=subscriptions
+
+# Netsapiens Settings
+NETSAPIENS_API_URL=https://<your server>
+NETSAPIENS_API_CLIENT_ID=<oauth client>
+NETSAPIENS_API_CLIENT_PASS=<oauth secret>

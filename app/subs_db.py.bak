@@ -1,0 +1,271 @@
+import traceback
+import logging
+from typing import Optional
+from datetime import datetime, timezone, timedelta
+from app.config import Config
+from app.db import DatabaseConnector
+from app.ns import NetsapiensAPI
+
+# Initialize logger
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
+
+
+class SubscriptionsDB(DatabaseConnector):
+    def __init__(self):
+        """Initialize SubscriptionsDB with the subscriptions table from Config."""
+        super().__init__()
+        self.table_name = Config.POSTGRESQL_TABLE_SUBSCRIPTIONS or "subscriptions"
+        self.ns_api = NetsapiensAPI()
+
+        if not isinstance(self.table_name, str) or not self.table_name.strip():
+            raise ValueError("Table name must be a non-empty string.")
+
+    async def setup_table(self):
+        """Ensure the subscriptions table exists in the database."""
+        method_name = "setup_table"
+
+        # Define the table creation SQL
+        create_table_sql = f"""
+        CREATE TABLE IF NOT EXISTS {self.table_name} (
+            id SERIAL PRIMARY KEY,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_updated VARCHAR(30),
+            domain VARCHAR(255) NOT NULL,
+            model VARCHAR(255) NOT NULL,
+            expires VARCHAR(255) NOT NULL,
+            subscription_id VARCHAR(255) NOT NULL UNIQUE,
+            post_url VARCHAR(255)
+        );
+        """
+
+        try:
+            if self.db_pool is None:
+                logger.warning(f"{method_name}: Connection pool is not initialized.")
+                return
+
+            async with self.db_pool.acquire() as connection:
+                logger.info(
+                    f"{method_name}: Ensuring table '{self.table_name}' exists."
+                )
+                await connection.execute(create_table_sql)
+                logger.info(
+                    f"{method_name}: Table '{self.table_name}' checked/created successfully."
+                )
+        except Exception as e:
+            logger.error(f"{method_name}: Error ensuring table exists - {e}")
+            raise RuntimeError(f"{method_name}: Failed to ensure table exists.") from e
+
+    async def fetch_expiring_subscriptions(self):
+        """Fetch subscriptions that are set to expire before the next renewal period."""
+        method_name = "fetch_expiring_subscriptions"
+
+        if self.db_pool is None:
+            logger.warning(f"{method_name} - Connection pool is not initialized.")
+            return None
+
+        # Calculate current time and renewal threshold (3600 seconds ahead)
+        now = datetime.now(timezone.utc)
+        renewal_threshold = now + timedelta(seconds=Config.RENEWAL_INTERVAL)
+
+        # SQL query to fetch subscriptions expiring before the threshold
+        query = f"""
+            SELECT id, domain, model, expires, subscription_id
+            FROM {self.table_name}
+            WHERE expires <= $1
+        """
+
+        try:
+            async with self.db_pool.acquire() as connection:
+                logger.info(
+                    f"{method_name} - Executing fetch query on '{self.table_name}'"
+                )
+
+                # Fetch subscriptions expiring before the threshold time
+                result = await connection.fetch(
+                    query, renewal_threshold.strftime("%Y-%m-%d %H:%M:%S")
+                )
+                logger.info(
+                    f"{method_name} - Fetched subscriptions expiring within the renewal interval."
+                )
+                return result
+
+        except Exception as e:
+            logger.error(f"{method_name} - Error reading from '{self.table_name}': {e}")
+            raise RuntimeError(
+                f"{method_name} - Failed to fetch expiring subscriptions."
+            ) from e
+
+    async def add_subscription(
+        self,
+        domain: str,
+        model: str,
+        expires: datetime,
+        subscription_id: str,
+        post_url: str,
+        user: Optional[str] = None,
+    ):
+        """Add a new subscription record to the database and create it in NetSapiens."""
+        method_name = "add_subscription"
+
+        # Format expires to string
+        formatted_expires = expires.strftime("%Y-%m-%d %H:%M:%S")
+
+        # Update query to include user
+        query = f"""
+            INSERT INTO {self.table_name} (domain, model, expires, subscription_id, post_url, "user")
+            VALUES ($1, $2, $3, $4, $5, $6)
+        """
+
+        try:
+            logger.debug(
+                f"{method_name} - Adding subscription {subscription_id} to database."
+            )
+            # Execute database insertion
+            await self.write_db(
+                self.table_name,
+                query,
+                domain,
+                model,
+                formatted_expires,
+                subscription_id,
+                post_url,
+                user,
+            )
+            logger.info(
+                f"{method_name} - Subscription {subscription_id} added to database successfully."
+            )
+        except Exception as e:
+            logger.error(
+                f"{method_name} - Database insertion failed for {subscription_id}: {e}"
+            )
+            raise RuntimeError(
+                f"{method_name} - Failed to add subscription to database."
+            ) from e
+
+        try:
+            logger.debug(
+                f"{method_name} - Creating subscription in NS API: {subscription_id}"
+            )
+            # Call the Netsapiens API, passing the optional user
+            subscription_response = await self.ns_api.create_subscription(
+                model, post_url, formatted_expires, domain, user=user
+            )
+            logger.info(
+                f"{method_name} - Subscription {subscription_id} created in NS API successfully."
+            )
+            return subscription_response
+        except Exception as e:
+            logger.error(
+                f"{method_name} - Failed to create subscription {subscription_id} in NS API: {e}"
+            )
+            logger.debug(
+                f"{method_name} - Rolling back subscription {subscription_id} from the database."
+            )
+            # Roll back the database entry if the API call fails
+            await self.delete_subscription(subscription_id)
+            raise RuntimeError(
+                f"{method_name} - Failed to create subscription in NS API."
+            ) from e
+
+    async def renew_subscription(self, subscription_id: str):
+        """Renew a subscription by creating or updating a new subscription in place."""
+        method_name = "renew_subscription"
+
+        # Prepare new expiration and last_updated as UTC strings
+        new_expiration = (
+            datetime.now(timezone.utc) + Config.SUBSCRIPTION_DURATION
+        ).strftime("%Y-%m-%d %H:%M:%S")
+        last_updated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+        # Fetch subscription details from the database
+        query = f"""
+            SELECT domain, model, post_url
+            FROM {self.table_name}
+            WHERE subscription_id = $1
+        """
+
+        try:
+            subscription_details = await self.read_db(
+                self.table_name, query, subscription_id
+            )
+
+            if not subscription_details:
+                logger.error(
+                    f"{method_name} - Subscription {subscription_id} not found."
+                )
+                raise ValueError(f"{method_name} - Subscription not found.")
+
+            # Extract subscription details
+            domain = subscription_details[0]["domain"]
+            model = subscription_details[0]["model"]
+            post_url = subscription_details[0]["post_url"]
+
+            # Attempt to create or update the subscription
+            logger.info(
+                f"{method_name} - Creating a new subscription with updated expiration."
+            )
+            new_subscription = await self.ns_api.create_subscription(
+                model=model, post_url=post_url, expires=new_expiration, domain=domain
+            )
+
+            # Check if a new subscription_id was provided after creation
+            if (
+                new_subscription
+                and new_subscription.get("subscription_id") != subscription_id
+            ):
+                new_subscription_id = new_subscription["subscription_id"]
+                logger.info(
+                    f"{method_name} - Subscription ID updated to {new_subscription_id}."
+                )
+            else:
+                new_subscription_id = (
+                    subscription_id  # Keep the same ID if it hasn't changed
+                )
+
+            # Update the database with the new subscription ID and expiration date
+            update_query = f"""
+                UPDATE {self.table_name}
+                SET subscription_id = $1, expires = $2, last_updated = $3
+                WHERE subscription_id = $4
+            """
+            await self.update_db(
+                self.table_name,
+                update_query,
+                new_subscription_id,
+                new_expiration,
+                last_updated,
+                subscription_id,
+            )
+            logger.info(
+                f"{method_name} - Database updated with new subscription details."
+            )
+
+        except Exception as e:
+            # Log detailed exception traceback to pinpoint the comparison location
+            logger.error(f"{method_name} - Exception occurred: {e}")
+            logger.debug(traceback.format_exc())
+            raise RuntimeError(f"{method_name} - Failed to renew subscription.") from e
+
+    async def delete_subscription(self, subscription_id: str):
+        """Delete a subscription from the database."""
+        method_name = "delete_subscription"
+        query = f"""
+            DELETE FROM {self.table_name} WHERE subscription_id = $1
+        """
+
+        try:
+            logger.debug(
+                f"{method_name} - Deleting subscription {subscription_id} from database."
+            )
+            await self.write_db(self.table_name, query, subscription_id)
+            logger.info(
+                f"{method_name} - Subscription {subscription_id} deleted successfully."
+            )
+        except Exception as e:
+            logger.error(
+                f"{method_name} - Failed to delete subscription {subscription_id}: {e}"
+            )
+            raise RuntimeError(
+                f"{method_name} - Failed to delete subscription from database."
+            ) from e

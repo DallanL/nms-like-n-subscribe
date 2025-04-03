@@ -1,0 +1,11 @@
+colorlog
+fastapi
+uvicorn
+asyncpg
+SQLAlchemy
+sqlalchemy[asyncio]
+httpx
+python-dotenv
+APScheduler
+psycopg2-binary
+
