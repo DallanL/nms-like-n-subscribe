@@ -1,5 +1,5 @@
 # Postgresql Settings
-POSTGRESQL_HOST=192.168.10.21
+POSTGRESQL_HOST=localhost
 POSTGRESQL_PORT=5432
 POSTGRESQL_USER=<postgresqluser>
 POSTGRESQL_PASS=<strongpassword>
